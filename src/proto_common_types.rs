@@ -1,13 +1,15 @@
+use std::collections::HashSet;
+
 /// Adds the schema of the common type imports
-pub(crate) fn add_common_files(imports: &Vec<String>, files: &mut Vec<String>) {
+pub(crate) fn add_common_files(imports: &Vec<String>, files: &mut HashSet<String>) {
     for import in imports {
         if let Some(common_schema) = is_common_import(import) {
-            files.push(String::from(get_schema(&common_schema)));
+            files.insert(String::from(get_schema(&common_schema)));
             continue;
         }
         if let Some(common_type) = is_common_type_import(import) {
             for common_schema in get_schemas(common_type) {
-                files.push(String::from(get_schema(common_schema)))
+                files.insert(String::from(get_schema(common_schema)));
             }
         }
     }
