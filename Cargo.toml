@@ -25,6 +25,9 @@ easy = ["tokio"]
 kafka_test = []
 default = ["futures", "native_tls"]
 
+[dependencies.log]
+version = "^0.4.21"
+
 [dependencies.byteorder]
 version = "^1.5"
 
@@ -87,7 +90,7 @@ rdkafka = { version = "^0.36.2", features = ["cmake-build"] }
 rand = "^0.8.5"
 test_utils = { path = "test_utils" }
 tokio = { version = "^1.38.0", features = ["macros"] }
-log = "0.4.21"
+log = "^0.4.21"
 
 [package.metadata.docs.rs]
 all-features = true
