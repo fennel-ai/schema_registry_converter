@@ -114,6 +114,7 @@ impl ProtoDecoder {
         match self.cache.entry(id) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
+                log::error!("Schema id: {} not found in cache", id);
                 let v = match get_schema_by_id_and_type(id, &self.sr_settings, SchemaType::Protobuf)
                 {
                     Ok(v) => to_resolve_context(&self.sr_settings, v),
