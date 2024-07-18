@@ -23,6 +23,7 @@ pub struct ProtoDecoder<'a> {
     sr_settings: SrSettings,
     direct_cache: DashMap<u32, Arc<Vec<String>>>,
     cache: DashMap<u32, SharedFutureSchema<'a>>,
+    context_cache: DashMap<u32, Result<Arc<DecodeContext>, SRCError>>,
 }
 
 impl<'a> ProtoDecoder<'a> {
@@ -36,6 +37,7 @@ impl<'a> ProtoDecoder<'a> {
             sr_settings,
             direct_cache: DashMap::new(),
             cache: DashMap::new(),
+            context_cache: Default::default(),
         }
     }
     /// Remove all the errors from the cache, you might need to/want to run this when a recoverable
@@ -100,19 +102,23 @@ impl<'a> ProtoDecoder<'a> {
         id: u32,
         bytes: &[u8],
     ) -> Result<DecodeResultWithContext, SRCError> {
-        let vec_of_schemas = self.get_vec_of_schemas(id).await?;
-        let context = into_decode_context(vec_of_schemas.to_vec())?;
-        let (index, data_bytes) = to_index_and_data(bytes);
-        let full_name = resolve_name(&context.resolver, &index)?;
-        let message_info = context.context.get_message(&full_name).unwrap();
-        let value = message_info.decode(&data_bytes, &context.context);
-        Ok(DecodeResultWithContext {
-            value,
-            context,
-            full_name,
-            data_bytes,
-        })
+        match self.context(id).await {
+            Ok(context) => {
+                let (index, data_bytes) = to_index_and_data(bytes);
+                let full_name = resolve_name(&context.resolver, &index)?;
+                let message_info = context.context.get_message(&full_name).unwrap();
+                let value = message_info.decode(&data_bytes, &context.context);
+                Ok(DecodeResultWithContext {
+                    value,
+                    context,
+                    full_name,
+                    data_bytes,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
+
     /// Gets the vector of schema's directly of via a shared future. The direct cache main function
     /// is for performance.
     async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
@@ -148,12 +154,25 @@ impl<'a> ProtoDecoder<'a> {
             }
         }
     }
+
+    /// Gets the Context object, either from the cache, or from the schema registry and then putting
+    /// it into the cache.
+    async fn context(&self, id: u32) -> Result<Arc<DecodeContext>, SRCError> {
+        match self.context_cache.entry(id) {
+            Entry::Occupied(e) => e.get().clone(),
+            Entry::Vacant(e) => {
+                let vec_of_schemas = self.get_vec_of_schemas(id).await?;
+                let v = into_decode_context(vec_of_schemas.to_vec()).map(|context| Arc::new(context));
+                e.insert(v).value().clone()
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct DecodeResultWithContext {
     pub value: MessageValue,
-    pub context: DecodeContext,
+    pub context: Arc<DecodeContext>,
     pub full_name: Arc<String>,
     pub data_bytes: Vec<u8>,
 }
