@@ -82,9 +82,11 @@ impl<'a> ProtoDecoder<'a> {
         &self,
         bytes: Option<&[u8]>,
     ) -> Result<Option<DecodeResultWithContext>, SRCError> {
+        println!("Fetching bytes & id for thread {:?}", std::thread::current().id());
         match get_bytes_result(bytes) {
             BytesResult::Null => Ok(None),
             BytesResult::Valid(id, bytes) => {
+                println!("Deserializing with context for thread {:?}", std::thread::current().id());
                 match self.deserialize_with_context(id, &bytes).await {
                     Ok(v) => Ok(Some(v)),
                     Err(e) => Err(e),
@@ -95,6 +97,7 @@ impl<'a> ProtoDecoder<'a> {
             }
         }
     }
+
     /// The actual deserialization trying to get the id from the bytes to retrieve the schema, and
     /// using a reader transforms the bytes to a value.
     async fn deserialize_with_context(
@@ -106,8 +109,10 @@ impl<'a> ProtoDecoder<'a> {
             Ok(context) => {
                 let (index, data_bytes) = to_index_and_data(bytes);
                 let full_name = resolve_name(&context.resolver, &index)?;
+                println!("Decoding with context for thread post context fetch {:?}", std::thread::current().id());
                 let message_info = context.context.get_message(&full_name).unwrap();
                 let value = message_info.decode(&data_bytes, &context.context);
+                println!("Decoding done with context for thread post decode {:?}", std::thread::current().id());
                 Ok(DecodeResultWithContext {
                     value,
                     context,
@@ -122,6 +127,7 @@ impl<'a> ProtoDecoder<'a> {
     /// Gets the vector of schema's directly of via a shared future. The direct cache main function
     /// is for performance.
     async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
+        println!("get_vec_of_schemas for thread {:?}", std::thread::current().id());
         match self.direct_cache.get(&id) {
             None => {
                 let result = self.get_vec_of_schemas_by_shared_future(id).await;
@@ -138,9 +144,11 @@ impl<'a> ProtoDecoder<'a> {
     /// schema registry, either from the cache, or from the schema registry and then putting
     /// it into the cache.
     fn get_vec_of_schemas_by_shared_future(&self, id: u32) -> SharedFutureSchema<'a> {
+        println!("get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
         match self.cache.entry(id) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
+                println!("Vacant get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
                 let sr_settings = self.sr_settings.clone();
                 let v = async move {
                     match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
@@ -150,6 +158,7 @@ impl<'a> ProtoDecoder<'a> {
                 }
                     .boxed()
                     .shared();
+                println!("Inserting get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
                 e.insert(v).value().clone()
             }
         }
@@ -158,10 +167,13 @@ impl<'a> ProtoDecoder<'a> {
     /// Gets the Context object, either from the cache, or from the schema registry and then putting
     /// it into the cache.
     async fn context(&self, id: u32) -> Result<Arc<DecodeContext>, SRCError> {
+        println!("Fetching context for thread {:?}", std::thread::current().id());
         match self.context_cache.entry(id) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
+                println!("Vacant for thread {:?}", std::thread::current().id());
                 let vec_of_schemas = self.get_vec_of_schemas(id).await?;
+                println!("Creating context for thread {:?}", std::thread::current().id());
                 let v = into_decode_context(vec_of_schemas.to_vec()).map(|context| Arc::new(context));
                 e.insert(v).value().clone()
             }
