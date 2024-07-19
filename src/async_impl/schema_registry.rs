@@ -193,7 +193,9 @@ pub async fn get_schema_by_id(
     id: u32,
     sr_settings: &SrSettings,
 ) -> Result<RegisteredSchema, SRCError> {
+    println!("Thread is is calling get_schema_by_id with id: {}", id);
     let raw_schema = perform_sr_call(sr_settings, SrCall::GetById(id)).await?;
+    print!("Thread is calling raw_to_registered_schema with id: {}", id);
     raw_to_registered_schema(raw_schema, Option::from(id)).await
 }
 
@@ -406,6 +408,7 @@ pub async fn perform_sr_call(
     let url_count = sr_settings.urls.len();
     let mut n = 0;
     loop {
+        println!("Thread is calling perform_sr_call with n: {}", n);
         let result = perform_single_sr_call(
             &sr_settings.urls[n],
             &sr_settings.client,
@@ -424,6 +427,7 @@ async fn apply_authentication(
     builder: RequestBuilder,
     authentication: &SrAuthorization,
 ) -> Result<Response, reqwest::Error> {
+    println!("Sending request with authentication: {:?} thread id {:?}", authentication, std::thread::current().id());   
     match authentication {
         SrAuthorization::None => builder.send().await,
         SrAuthorization::Token(token) => builder.bearer_auth(token).send().await,
@@ -452,9 +456,11 @@ async fn perform_single_sr_call(
             .post(&url)
             .body(String::from(body))
             .header(CONTENT_TYPE, "application/vnd.schemaregistry.v1+json")
-            .header(ACCEPT, "application/vnd.schemaregistry.v1+json"),
+            .header(ACCEPT, "application/vnd.schemaregistry.v1+json")
     };
+    let builder = builder.timeout(Duration::from_secs(30));
     let call = apply_authentication(builder, authentication).await;
+    println!("Thread is done calling perform_single_sr_call with url: {}", url);
     match call {
         Ok(v) => match v.json::<RawRegisteredSchema>().await {
             Ok(r) => Ok(r),

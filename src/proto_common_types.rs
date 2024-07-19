@@ -3651,6 +3651,7 @@ mod tests {
         assert!(get_schema(&CommonSchema::TimeOfDay).starts_with("// Copyright 2021 Google LLC"));
         assert!(get_schema(&CommonSchema::Type).starts_with("type: google.api.Service"));
     }
+    use std::collections::HashSet;
 
     #[test]
     fn test_add_common_files_with_all_common_schemas() {
@@ -3667,7 +3668,7 @@ mod tests {
             String::from("google/protobuf/wrappers.proto"),
         ];
 
-        let mut files: Vec<String> = vec![];
+        let mut files: HashSet<String> = HashSet::new();
 
         add_common_files(&test_imports, &mut files);
 

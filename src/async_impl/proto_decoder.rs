@@ -19,36 +19,32 @@ use protofish::decode::{MessageValue, Value};
 type SharedFutureSchema<'a> = Shared<BoxFuture<'a, Result<Arc<Vec<String>>, SRCError>>>;
 
 #[derive(Debug)]
-pub struct ProtoDecoder<'a> {
+pub struct ProtoDecoder {
     sr_settings: SrSettings,
-    direct_cache: DashMap<u32, Arc<Vec<String>>>,
-    cache: DashMap<u32, SharedFutureSchema<'a>>,
     context_cache: DashMap<u32, Result<Arc<DecodeContext>, SRCError>>,
 }
 
-impl<'a> ProtoDecoder<'a> {
+impl<'a> ProtoDecoder {
     /// Creates a new decoder which will use the supplied url used in creating the sr settings to
     /// fetch the schema's since the schema needed is encoded in the binary, independent of the
     /// SubjectNameStrategy we don't need any additional data. It's possible for recoverable errors
     /// to stay in the cache, when a result comes back as an error you can use
     /// remove_errors_from_cache to clean the cache, keeping the correctly fetched schema's
-    pub fn new(sr_settings: SrSettings) -> ProtoDecoder<'a> {
+    pub fn new(sr_settings: SrSettings) -> ProtoDecoder {
         ProtoDecoder {
             sr_settings,
-            direct_cache: DashMap::new(),
-            cache: DashMap::new(),
             context_cache: Default::default(),
         }
     }
     /// Remove all the errors from the cache, you might need to/want to run this when a recoverable
     /// error is met. Errors are also cashed to prevent trying to get schema's that either don't
     /// exist or can't be parsed.
-    pub fn remove_errors_from_cache(&self) {
-        self.cache.retain(|_, v| match v.peek() {
-            Some(r) => r.is_ok(),
-            None => true,
-        });
-    }
+    // pub fn remove_errors_from_cache(&self) {
+    //     self.cache.retain(|_, v| match v.peek() {
+    //         Some(r) => r.is_ok(),
+    //         None => true,
+    //     });
+    // }
     /// Decodes bytes into a value.
     /// The choice to use Option<&[u8]> as type us made so it plays nice with the BorrowedMessage
     /// struct from rdkafka, for example if we have m: &'a BorrowedMessage and decoder: &'a
@@ -127,42 +123,16 @@ impl<'a> ProtoDecoder<'a> {
     /// Gets the vector of schema's directly of via a shared future. The direct cache main function
     /// is for performance.
     async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
-        println!("get_vec_of_schemas for thread {:?}", std::thread::current().id());
-        match self.direct_cache.get(&id) {
-            None => {
-                let result = self.get_vec_of_schemas_by_shared_future(id).await;
-                if result.is_ok() && !self.direct_cache.contains_key(&id) {
-                    self.direct_cache.insert(id, result.clone().unwrap());
-                    self.cache.remove(&id);
-                };
-                result
+        let sr_settings = self.sr_settings.clone();
+        match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
+                Ok(v) => {
+                    println!("Getting vec of schemas for thread {:?}", std::thread::current().id());
+                    to_vec_of_schemas(&sr_settings, v).await
+                },
+                Err(e) => Err(e.into_cache()),
             }
-            Some(result) => Ok(result.value().clone()),
-        }
     }
-    /// Gets the vector of schema's by a shared future, to prevent multiple of the same calls to
-    /// schema registry, either from the cache, or from the schema registry and then putting
-    /// it into the cache.
-    fn get_vec_of_schemas_by_shared_future(&self, id: u32) -> SharedFutureSchema<'a> {
-        println!("get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
-        match self.cache.entry(id) {
-            Entry::Occupied(e) => e.get().clone(),
-            Entry::Vacant(e) => {
-                println!("Vacant get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
-                let sr_settings = self.sr_settings.clone();
-                let v = async move {
-                    match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
-                        Ok(v) => to_vec_of_schemas(&sr_settings, v).await,
-                        Err(e) => Err(e.into_cache()),
-                    }
-                }
-                    .boxed()
-                    .shared();
-                println!("Inserting get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
-                e.insert(v).value().clone()
-            }
-        }
-    }
+
 
     /// Gets the Context object, either from the cache, or from the schema registry and then putting
     /// it into the cache.
@@ -189,20 +159,38 @@ pub struct DecodeResultWithContext {
     pub data_bytes: Vec<u8>,
 }
 
-fn add_files<'a>(
+// fn add_files<'a>(
+//     sr_settings: &'a SrSettings,
+//     registered_schema: RegisteredSchema,
+//     files: &'a mut Vec<String>,
+// ) -> BoxFuture<'a, Result<(), SRCError>> {
+//     async move {
+//         for r in registered_schema.references {
+//             let child_schema = get_referenced_schema(sr_settings, &r).await?;
+//             add_files(sr_settings, child_schema, files).await?;
+//         }
+//         files.push(registered_schema.schema);
+//         Ok(())
+//     }
+//         .boxed()
+// }
+
+async fn add_files<'a>(
     sr_settings: &'a SrSettings,
     registered_schema: RegisteredSchema,
     files: &'a mut Vec<String>,
-) -> BoxFuture<'a, Result<(), SRCError>> {
-    async move {
-        for r in registered_schema.references {
+) -> Result<(), SRCError> {
+    let mut stack = vec![registered_schema];
+
+    while let Some(current_schema) = stack.pop() {
+        for r in current_schema.references {
             let child_schema = get_referenced_schema(sr_settings, &r).await?;
-            add_files(sr_settings, child_schema, files).await?;
+            stack.push(child_schema);
         }
-        files.push(registered_schema.schema);
-        Ok(())
+        files.push(current_schema.schema);
     }
-        .boxed()
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -233,6 +221,7 @@ async fn to_vec_of_schemas(
     registered_schema: RegisteredSchema,
 ) -> Result<Arc<Vec<String>>, SRCError> {
     let mut vec_of_schemas = Vec::new();
+    println!("Adding files for thread {:?}", std::thread::current().id());
     add_files(sr_settings, registered_schema, &mut vec_of_schemas).await?;
     Ok(Arc::new(vec_of_schemas))
 }
