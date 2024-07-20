@@ -94,6 +94,58 @@ impl<'a> ProtoDecoder {
         }
     }
 
+    /// Sync path ---------------------------------------------------
+
+
+    pub fn decode_with_context_sync(
+        &self,
+        bytes: Option<&[u8]>,
+    ) -> Result<Option<DecodeResultWithContext>, SRCError> {
+        //println!("Fetching bytes & id for thread {:?}", std::thread::current().id());
+        match get_bytes_result(bytes) {
+            BytesResult::Null => Ok(None),
+            BytesResult::Valid(id, bytes) => {
+                //println!("Deserializing with context for thread {:?}", std::thread::current().id());
+                match self.deserialize_with_context_sync(id, &bytes) {
+                    Ok(v) => Ok(Some(v)),
+                    Err(e) => Err(e),
+                }
+            }
+            BytesResult::Invalid(_) => {
+                Err(SRCError::new("no protobuf compatible bytes", None, false))
+            }
+        }
+    }
+
+
+    fn deserialize_with_context_sync(
+        &self,
+        id: u32,
+        bytes: &[u8],
+    ) -> Result<DecodeResultWithContext, SRCError> {
+        match self.context_cache.entry(id) {
+            Entry::Occupied(e) => { 
+                let context = e.get().clone()?;
+                let (index, data_bytes) = to_index_and_data(bytes);
+                let full_name = resolve_name(&context.resolver, &index)?;
+                //println!("Decoding with context for thread post context fetch {:?}", std::thread::current().id());
+                let message_info = context.context.get_message(&full_name).unwrap();
+                let value = message_info.decode(&data_bytes, &context.context);
+                //println!("Decoding done with context for thread post decode {:?}", std::thread::current().id());
+                Ok(DecodeResultWithContext {
+                    value,
+                    context,
+                    full_name,
+                    data_bytes,
+                })
+            }
+            Entry::Vacant(e) => return Err(SRCError::new("Could not find context", None, false)),
+        }
+    }
+
+    /// End of sync path ---------------------------------------------------
+         
+
     /// The actual deserialization trying to get the id from the bytes to retrieve the schema, and
     /// using a reader transforms the bytes to a value.
     async fn deserialize_with_context(
