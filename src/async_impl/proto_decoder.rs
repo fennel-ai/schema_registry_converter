@@ -82,11 +82,9 @@ impl<'a> ProtoDecoder<'a> {
         &self,
         bytes: Option<&[u8]>,
     ) -> Result<Option<DecodeResultWithContext>, SRCError> {
-        println!("Fetching bytes & id for thread {:?}", std::thread::current().id());
         match get_bytes_result(bytes) {
             BytesResult::Null => Ok(None),
             BytesResult::Valid(id, bytes) => {
-                println!("Deserializing with context for thread {:?}", std::thread::current().id());
                 match self.deserialize_with_context(id, &bytes).await {
                     Ok(v) => Ok(Some(v)),
                     Err(e) => Err(e),
@@ -109,10 +107,8 @@ impl<'a> ProtoDecoder<'a> {
             Ok(context) => {
                 let (index, data_bytes) = to_index_and_data(bytes);
                 let full_name = resolve_name(&context.resolver, &index)?;
-                println!("Decoding with context for thread post context fetch {:?}", std::thread::current().id());
                 let message_info = context.context.get_message(&full_name).unwrap();
                 let value = message_info.decode(&data_bytes, &context.context);
-                println!("Decoding done with context for thread post decode {:?}", std::thread::current().id());
                 Ok(DecodeResultWithContext {
                     value,
                     context,
@@ -167,7 +163,6 @@ impl<'a> ProtoDecoder<'a> {
     /// Gets the Context object, either from the cache, or from the schema registry and then putting
     /// it into the cache.
     async fn context(&self, id: u32) -> Result<Arc<DecodeContext>, SRCError> {
-        println!("Fetching context for thread {:?}", std::thread::current().id());
         match self.context_cache.entry(id) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
