@@ -27,10 +27,9 @@ use std::sync::Arc;
 
 use apache_avro::types::Value;
 use apache_avro::{from_avro_datum, Schema};
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
+use scc::{HashMap, hash_map::Entry};
 use serde::ser::Serialize;
 use serde_json::value;
 
@@ -82,25 +81,23 @@ use crate::schema_registry_common::{
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct AvroDecoder<'a> {
+pub struct AvroDecoder {
     sr_settings: SrSettings,
-    direct_cache: DashMap<u32, Arc<AvroSchema>>,
-    cache: DashMap<u32, SharedFutureSchema<'a>>,
+    cache: HashMap<u32, Arc<AvroSchema>>,
+    error_cache: HashMap<u32, SRCError>,
 }
 
-type SharedFutureSchema<'a> = Shared<BoxFuture<'a, Result<Arc<AvroSchema>, SRCError>>>;
-
-impl<'a> AvroDecoder<'a> {
+impl AvroDecoder {
     /// Creates a new decoder which will use the supplied url to fetch the schema's since the schema
     /// needed is encoded in the binary, independent of the SubjectNameStrategy we don't need any
     /// additional data. It's possible for recoverable errors to stay in the cash, when a result
     /// comes back as an error you can use remove_errors_from_cache to clean the cache, keeping the
     /// correctly fetched schema's
-    pub fn new(sr_settings: SrSettings) -> AvroDecoder<'a> {
+    pub fn new(sr_settings: SrSettings) -> AvroDecoder {
         AvroDecoder {
             sr_settings,
-            direct_cache: DashMap::new(),
-            cache: DashMap::new(),
+            error_cache: HashMap::new(),
+            cache: HashMap::new(),
         }
     }
     /// Remove al the errors from the cache, you might need to/want to run this when a recoverable
@@ -147,10 +144,7 @@ impl<'a> AvroDecoder<'a> {
     /// # }
     /// ```
     pub fn remove_errors_from_cache(&self) {
-        self.cache.retain(|_, v| match v.peek() {
-            Some(r) => r.is_ok(),
-            None => true,
-        });
+        self.error_cache.clear();
     }
     /// Decodes bytes into a value.
     /// The choice to use Option<&[u8]> as type us made so it plays nice with the BorrowedMessage
@@ -164,7 +158,7 @@ impl<'a> AvroDecoder<'a> {
     /// use schema_registry_converter::async_impl::avro::AvroDecoder;
     /// async fn get_value (
     ///     msg: &'_ BorrowedMessage <'_>,
-    ///     decoder: &'_ AvroDecoder <'_>,
+    ///     decoder: &'_ AvroDecoder,
     /// ) -> Value{
     ///     match decoder.decode(msg.payload()).await{
     ///         Ok(r) => r.value,
@@ -245,39 +239,36 @@ impl<'a> AvroDecoder<'a> {
     }
 
     async fn get_schema(&self, id: u32) -> Result<Arc<AvroSchema>, SRCError> {
-        match self.direct_cache.get(&id) {
-            None => {
-                let result = self.get_schema_by_shared_future(id).await;
-                if result.is_ok() && !self.direct_cache.contains_key(&id) {
-                    self.direct_cache.insert(id, result.clone().unwrap());
-                    self.cache.remove(&id);
-                };
-                result
-            }
-            Some(result) => Ok(result.value().clone()),
-        }
-    }
-
-    fn get_schema_by_shared_future(&self, id: u32) -> SharedFutureSchema<'a> {
-        match self.cache.entry(id) {
-            Entry::Occupied(e) => e.get().clone(),
+        match self.cache.entry_async(id).await {
+            Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
+                // Return the cached error if it exists.
+                if let Some(err) = self.error_cache.get(&id) {
+                    return Err(err.get().clone());
+                }
                 let sr_settings = self.sr_settings.clone();
-                let v = async move {
-                    match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Avro).await {
-                        Ok(registered_schema) => {
-                            to_avro_schema(&sr_settings, registered_schema).await
-                        }
-                        Err(e) => Err(e.into_cache()),
+                let result = match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Avro).await {
+                    Ok(registered_schema) => {
+                        to_avro_schema(&sr_settings, registered_schema).await
+                    }
+                    Err(e) => Err(e.into_cache()),
+                };
+                match result {
+                    Ok(v) => {
+                        Ok(e.insert_entry(v).get().clone())
+                    }
+                    Err(e) => {
+                        let e = e.into_cache();
+                        self.error_cache.insert(id, e.clone()).unwrap();
+                        Err(e)
                     }
                 }
-                .boxed()
-                .shared();
-                e.insert(v).value().clone()
             }
         }
     }
 }
+
+type SharedFutureSchema<'a> = Shared<BoxFuture<'a, Result<Arc<AvroSchema>, SRCError>>>;
 
 /// An encoder used to transform a Value object to bytes
 ///
@@ -331,8 +322,8 @@ impl<'a> AvroDecoder<'a> {
 #[derive(Debug)]
 pub struct AvroEncoder<'a> {
     sr_settings: SrSettings,
-    direct_cache: DashMap<String, Arc<AvroSchema>>,
-    cache: DashMap<String, SharedFutureSchema<'a>>,
+    direct_cache: HashMap<String, Arc<AvroSchema>>,
+    cache: HashMap<String, SharedFutureSchema<'a>>,
 }
 
 impl<'a> AvroEncoder<'a> {
@@ -376,8 +367,8 @@ impl<'a> AvroEncoder<'a> {
     pub fn new(sr_settings: SrSettings) -> AvroEncoder<'a> {
         AvroEncoder {
             sr_settings,
-            direct_cache: DashMap::new(),
-            cache: DashMap::new(),
+            direct_cache: HashMap::new(),
+            cache: HashMap::new(),
         }
     }
     /// Remove al the errors from the cache, you might need to/want to run this when a recoverable
@@ -542,14 +533,14 @@ impl<'a> AvroEncoder<'a> {
                 let result = self
                     .get_schema_and_id_by_shared_future(key.to_string(), subject_name_strategy)
                     .await;
-                if result.is_ok() && !self.direct_cache.contains_key(key) {
+                if result.is_ok() && !self.direct_cache.contains(key) {
                     self.direct_cache
-                        .insert(key.to_string(), result.clone().unwrap());
+                        .insert(key.to_string(), result.clone().unwrap()).unwrap();
                     self.cache.remove(key);
                 };
                 result
             }
-            Some(result) => Ok(result.value().clone()),
+            Some(result) => Ok(result.get().clone()),
         }
     }
 
@@ -572,7 +563,7 @@ impl<'a> AvroEncoder<'a> {
                 }
                 .boxed()
                 .shared();
-                e.insert(v).value().clone()
+                e.insert_entry(v).get().clone()
             }
         }
     }
@@ -675,7 +666,7 @@ mod tests {
         let sr_settings = SrSettings::new(String::from("http://127.0.0.1:1234"));
         let decoder = AvroDecoder::new(sr_settings);
         assert_eq!(
-            "AvroDecoder { sr_settings: SrSettings { urls: [\"http://127.0.0.1:1234\"], client: Client { accepts: Accepts, proxies: [Proxy(System({}), None)], referer: true, default_headers: {\"accept\": \"*/*\"} }, authorization: None }, direct_cache: {}, cache: {} }"
+            "AvroDecoder { sr_settings: SrSettings { urls: [\"http://127.0.0.1:1234\"], client: Client { accepts: Accepts, proxies: [Proxy(System({}), None)], referer: true, default_headers: {\"accept\": \"*/*\"} }, authorization: None }, cache: {}, error_cache: {} }"
                 .to_owned(),
             format!("{:?}", decoder)
         )
