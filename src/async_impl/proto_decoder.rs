@@ -4,7 +4,7 @@ use scc::{HashMap, hash_map::Entry};
 use defer::defer;
 use futures::future::BoxFuture;
 use futures::FutureExt;
-use log::info;
+use log::{debug, info};
 use std::sync::Arc;
 
 use crate::async_impl::schema_registry::{
@@ -62,9 +62,9 @@ impl ProtoDecoder {
     /// The actual deserialization trying to get the id from the bytes to retrieve the schema, and
     /// using a reader transforms the bytes to a value.
     async fn deserialize(&self, id: u32, bytes: &[u8]) -> Result<MessageValue, SRCError> {
-        info!("{:?}: Enter: deserialize", std::thread::current().id());
+        debug!("{:?}: Enter: deserialize", std::thread::current().id());
         defer! {
-            info!("{:?}: Exit: deserialize", std::thread::current().id())
+            debug!("{:?}: Exit: deserialize", std::thread::current().id())
         }
         let vec_of_schemas = self.get_vec_of_schemas(id).await?;
         let context = into_decode_context(vec_of_schemas.to_vec())?;
@@ -82,9 +82,9 @@ impl ProtoDecoder {
         &self,
         bytes: Option<&[u8]>,
     ) -> Result<Option<DecodeResultWithContext>, SRCError> {
-        info!("{:?}: Enter: decode_with_context", std::thread::current().id());
+        debug!("{:?}: Enter: decode_with_context", std::thread::current().id());
         defer! {
-            info!("{:?}: Exit: decode_with_context", std::thread::current().id())
+            debug!("{:?}: Exit: decode_with_context", std::thread::current().id())
         }
         match get_bytes_result(bytes) {
             BytesResult::Null => Ok(None),
@@ -107,9 +107,9 @@ impl ProtoDecoder {
         id: u32,
         bytes: &[u8],
     ) -> Result<DecodeResultWithContext, SRCError> {
-        info!("{:?}: Enter: deserialize_with_context", std::thread::current().id());
+        debug!("{:?}: Enter: deserialize_with_context", std::thread::current().id());
         defer! {
-            info!("{:?}: Exit: deserialize_with_context", std::thread::current().id())
+            debug!("{:?}: Exit: deserialize_with_context", std::thread::current().id())
         }
         match self.context(id).await {
             Ok(context) => {
@@ -171,9 +171,9 @@ impl ProtoDecoder {
     /// Gets the Context object, either from the cache, or from the schema registry and then putting
     /// it into the cache.
     async fn context(&self, id: u32) -> Result<Arc<DecodeContext>, SRCError> {
-        info!("{:?}: Enter: context", std::thread::current().id());
+        debug!("{:?}: Enter: context", std::thread::current().id());
         defer! {
-            info!("{:?}: Exit: context", std::thread::current().id())
+            debug!("{:?}: Exit: context", std::thread::current().id())
         }
         match self.context_cache.entry_async(id).await {
             Entry::Occupied(e) => Ok(e.get().clone()),
