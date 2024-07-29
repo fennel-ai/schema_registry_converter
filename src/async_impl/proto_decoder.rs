@@ -1,9 +1,8 @@
 use std::collections::HashSet;
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
+use scc::{HashMap, hash_map::Entry};
 use defer::defer;
-use futures::future::{BoxFuture, Shared};
+use futures::future::BoxFuture;
 use futures::FutureExt;
 use log::info;
 use std::sync::Arc;
@@ -18,27 +17,25 @@ use crate::schema_registry_common::{get_bytes_result, BytesResult, RegisteredSch
 use protofish::context::Context;
 use protofish::decode::{MessageValue, Value};
 
-type SharedFutureSchema<'a> = Shared<BoxFuture<'a, Result<Arc<Vec<String>>, SRCError>>>;
-
 #[derive(Debug)]
-pub struct ProtoDecoder<'a> {
+pub struct ProtoDecoder {
     sr_settings: SrSettings,
-    direct_cache: DashMap<u32, Arc<Vec<String>>>,
-    cache: DashMap<u32, SharedFutureSchema<'a>>,
-    context_cache: DashMap<u32, Result<Arc<DecodeContext>, SRCError>>,
+    error_cache: HashMap<u32, SRCError>,
+    cache: HashMap<u32, Arc<Vec<String>>>,
+    context_cache: HashMap<u32, Arc<DecodeContext>>,
 }
 
-impl<'a> ProtoDecoder<'a> {
+impl ProtoDecoder {
     /// Creates a new decoder which will use the supplied url used in creating the sr settings to
     /// fetch the schema's since the schema needed is encoded in the binary, independent of the
     /// SubjectNameStrategy we don't need any additional data. It's possible for recoverable errors
     /// to stay in the cache, when a result comes back as an error you can use
     /// remove_errors_from_cache to clean the cache, keeping the correctly fetched schema's
-    pub fn new(sr_settings: SrSettings) -> ProtoDecoder<'a> {
+    pub fn new(sr_settings: SrSettings) -> ProtoDecoder {
         ProtoDecoder {
             sr_settings,
-            direct_cache: DashMap::new(),
-            cache: DashMap::new(),
+            cache: HashMap::new(),
+            error_cache: HashMap::new(),
             context_cache: Default::default(),
         }
     }
@@ -46,10 +43,7 @@ impl<'a> ProtoDecoder<'a> {
     /// error is met. Errors are also cashed to prevent trying to get schema's that either don't
     /// exist or can't be parsed.
     pub fn remove_errors_from_cache(&self) {
-        self.cache.retain(|_, v| match v.peek() {
-            Some(r) => r.is_ok(),
-            None => true,
-        });
+        self.error_cache.clear();
     }
     /// Decodes bytes into a value.
     /// The choice to use Option<&[u8]> as type us made so it plays nice with the BorrowedMessage
@@ -134,48 +128,42 @@ impl<'a> ProtoDecoder<'a> {
         }
     }
 
-    /// Gets the vector of schema's directly of via a shared future. The direct cache main function
-    /// is for performance.
-    async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
-        info!("{:?}: Enter: get_vec_of_schemas", std::thread::current().id());
-        defer! {
-            info!("{:?}: Exit: get_vec_of_schemas", std::thread::current().id())
-        }
-        match self.direct_cache.get(&id) {
-            None => {
-                let result = self.get_vec_of_schemas_by_shared_future(id).await;
-                if result.is_ok() && !self.direct_cache.contains_key(&id) {
-                    self.direct_cache.insert(id, result.clone().unwrap());
-                    self.cache.remove(&id);
-                };
-                result
-            }
-            Some(result) => Ok(result.value().clone()),
-        }
-    }
     /// Gets the vector of schema's by a shared future, to prevent multiple of the same calls to
     /// schema registry, either from the cache, or from the schema registry and then putting
     /// it into the cache.
-    fn get_vec_of_schemas_by_shared_future(&self, id: u32) -> SharedFutureSchema<'a> {
-        info!("{:?}: Enter: get_vec_of_schemas_by_shared_future", std::thread::current().id());
+    async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
+        info!("Thread {:?}: Enter: get_vec_of_schemas for schema id: {}", std::thread::current().id(), id);
         defer! {
-            info!("{:?}: Exit: get_vec_of_schemas_by_shared_future", std::thread::current().id())
+            info!("Thread {:?}: Exit: get_vec_of_schemas for schema id: {}", std::thread::current().id(), id)
         }
-        match self.cache.entry(id) {
-            Entry::Occupied(e) => e.get().clone(),
+        match self.cache.entry_async(id).await {
+            Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
-                println!("Vacant get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
+                // Return the cached error if it exists.
+                if let Some(err) = self.error_cache.get(&id) {
+                    info!("Thread {:?}: cached error for schema id {} - {:?}", std::thread::current().id(), id, err);
+                    return Err(err.get().clone());
+                }
+                info!("Thread {:?}: Vacant get_vec_of_schemas for schema id {}", std::thread::current().id(), id);
                 let sr_settings = self.sr_settings.clone();
-                let v = async move {
-                    match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
-                        Ok(v) => to_vec_of_schemas(&sr_settings, v).await,
-                        Err(e) => Err(e.into_cache()),
+                let result = match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
+                    Ok(registered_schema) => {
+                        to_vec_of_schemas(&sr_settings, registered_schema).await
+                    }
+                    Err(err) => Err(err)
+                };
+                match result {
+                    Ok(v) => {
+                        info!("Thread {:?}: Inserting schema for id {}", std::thread::current().id(), id);
+                        Ok(e.insert_entry(v).get().clone())
+                    }
+                    Err(e) => {
+                        let e = e.into_cache();
+                        info!("Thread {:?}: Inserting error for schema id {}", std::thread::current().id(), id);
+                        self.error_cache.insert(id, e.clone()).unwrap();
+                        Err(e)
                     }
                 }
-                    .boxed()
-                    .shared();
-                println!("Inserting get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
-                e.insert(v).value().clone()
             }
         }
     }
@@ -187,14 +175,14 @@ impl<'a> ProtoDecoder<'a> {
         defer! {
             info!("{:?}: Exit: context", std::thread::current().id())
         }
-        match self.context_cache.entry(id) {
-            Entry::Occupied(e) => e.get().clone(),
+        match self.context_cache.entry_async(id).await {
+            Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
-                println!("Vacant for thread {:?}", std::thread::current().id());
+                info!("Thread {:?} - Vacant context for schema id {}", std::thread::current().id(), id);
                 let vec_of_schemas = self.get_vec_of_schemas(id).await?;
-                println!("Creating context for thread {:?}", std::thread::current().id());
-                let v = into_decode_context(vec_of_schemas.to_vec()).map(|context| Arc::new(context));
-                e.insert(v).value().clone()
+                info!("Thread {:?} - Creating context for schema id {}", std::thread::current().id(), id);
+                let v = into_decode_context(vec_of_schemas.to_vec()).map(|context| Arc::new(context))?;
+                Ok(e.insert_entry(v).get().clone())
             }
         }
     }
