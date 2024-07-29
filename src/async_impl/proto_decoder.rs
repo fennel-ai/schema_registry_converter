@@ -2,8 +2,10 @@ use std::collections::HashSet;
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
+use defer::defer;
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
+use log::info;
 use std::sync::Arc;
 
 use crate::async_impl::schema_registry::{
@@ -66,6 +68,10 @@ impl<'a> ProtoDecoder<'a> {
     /// The actual deserialization trying to get the id from the bytes to retrieve the schema, and
     /// using a reader transforms the bytes to a value.
     async fn deserialize(&self, id: u32, bytes: &[u8]) -> Result<MessageValue, SRCError> {
+        info!("{:?}: Enter: deserialize", std::thread::current().id());
+        defer! {
+            info!("{:?}: Exit: deserialize", std::thread::current().id())
+        }
         let vec_of_schemas = self.get_vec_of_schemas(id).await?;
         let context = into_decode_context(vec_of_schemas.to_vec())?;
         let (index, data) = to_index_and_data(bytes);
@@ -82,6 +88,10 @@ impl<'a> ProtoDecoder<'a> {
         &self,
         bytes: Option<&[u8]>,
     ) -> Result<Option<DecodeResultWithContext>, SRCError> {
+        info!("{:?}: Enter: decode_with_context", std::thread::current().id());
+        defer! {
+            info!("{:?}: Exit: decode_with_context", std::thread::current().id())
+        }
         match get_bytes_result(bytes) {
             BytesResult::Null => Ok(None),
             BytesResult::Valid(id, bytes) => {
@@ -103,6 +113,10 @@ impl<'a> ProtoDecoder<'a> {
         id: u32,
         bytes: &[u8],
     ) -> Result<DecodeResultWithContext, SRCError> {
+        info!("{:?}: Enter: deserialize_with_context", std::thread::current().id());
+        defer! {
+            info!("{:?}: Exit: deserialize_with_context", std::thread::current().id())
+        }
         match self.context(id).await {
             Ok(context) => {
                 let (index, data_bytes) = to_index_and_data(bytes);
@@ -123,7 +137,10 @@ impl<'a> ProtoDecoder<'a> {
     /// Gets the vector of schema's directly of via a shared future. The direct cache main function
     /// is for performance.
     async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
-        println!("get_vec_of_schemas for thread {:?}", std::thread::current().id());
+        info!("{:?}: Enter: get_vec_of_schemas", std::thread::current().id());
+        defer! {
+            info!("{:?}: Exit: get_vec_of_schemas", std::thread::current().id())
+        }
         match self.direct_cache.get(&id) {
             None => {
                 let result = self.get_vec_of_schemas_by_shared_future(id).await;
@@ -140,7 +157,10 @@ impl<'a> ProtoDecoder<'a> {
     /// schema registry, either from the cache, or from the schema registry and then putting
     /// it into the cache.
     fn get_vec_of_schemas_by_shared_future(&self, id: u32) -> SharedFutureSchema<'a> {
-        println!("get_vec_of_schemas_by_shared_future for thread {:?}", std::thread::current().id());
+        info!("{:?}: Enter: get_vec_of_schemas_by_shared_future", std::thread::current().id());
+        defer! {
+            info!("{:?}: Exit: get_vec_of_schemas_by_shared_future", std::thread::current().id())
+        }
         match self.cache.entry(id) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
@@ -163,6 +183,10 @@ impl<'a> ProtoDecoder<'a> {
     /// Gets the Context object, either from the cache, or from the schema registry and then putting
     /// it into the cache.
     async fn context(&self, id: u32) -> Result<Arc<DecodeContext>, SRCError> {
+        info!("{:?}: Enter: context", std::thread::current().id());
+        defer! {
+            info!("{:?}: Exit: context", std::thread::current().id())
+        }
         match self.context_cache.entry(id) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
