@@ -231,10 +231,13 @@ impl AvroDecoder {
                 value,
                 schema,
             }),
-            Err(e) => Err(SRCError::non_retryable_with_cause(
-                e,
-                "Could not transform bytes using schema",
-            )),
+            Err(e) => {
+                let err_str = format!("Could not transform bytes using schema: {:?} with id: {}", schema, id);
+                Err(SRCError::non_retryable_with_cause(
+                    e,
+                    &err_str,
+                ))
+            },
         }
     }
 
