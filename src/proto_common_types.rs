@@ -3599,6 +3599,7 @@ message BytesValue {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use crate::proto_common_types::{
         add_common_files, get_schema, get_schemas, CommonSchema, CommonType,
     };
@@ -3667,7 +3668,7 @@ mod tests {
             String::from("google/protobuf/wrappers.proto"),
         ];
 
-        let mut files: Vec<String> = vec![];
+        let mut files = HashSet::new();
 
         add_common_files(&test_imports, &mut files);
 

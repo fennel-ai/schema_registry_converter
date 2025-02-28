@@ -2,27 +2,27 @@ use std::io::BufReader;
 use std::sync::Arc;
 
 use crate::error::SRCError;
-use dashmap::DashMap;
+use scc::HashMap;
 use integer_encoding::VarIntReader;
 use logos::Logos;
 
 #[derive(Debug, Clone)]
 pub struct MessageResolver {
-    pub map: DashMap<Vec<i32>, Arc<String>>,
+    pub map: HashMap<Vec<i32>, Arc<String>>,
     pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct IndexResolver {
-    map: DashMap<String, Arc<Vec<i32>>>,
+    map: HashMap<String, Arc<Vec<i32>>>,
 }
 
 impl MessageResolver {
     pub fn new(s: &str) -> MessageResolver {
         let helper = ResolverHelper::new(s);
-        let map = DashMap::new();
+        let map = HashMap::new();
         for i in &helper.indexes {
-            map.insert(i.clone(), Arc::new(find_name(i, &helper)));
+            let _ = map.insert(i.clone(), Arc::new(find_name(i, &helper)));
         }
         MessageResolver {
             map,
@@ -31,7 +31,7 @@ impl MessageResolver {
     }
 
     pub fn find_name(&self, index: &[i32]) -> Option<Arc<String>> {
-        self.map.get(index).map(|e| e.value().clone())
+        self.map.get(index).map(|e| e.get().clone())
     }
     pub fn imports(&self) -> &Vec<String> {
         &self.imports
@@ -41,15 +41,15 @@ impl MessageResolver {
 impl IndexResolver {
     pub fn new(s: &str) -> IndexResolver {
         let helper = ResolverHelper::new(s);
-        let map = DashMap::new();
+        let map = HashMap::new();
         for i in &helper.indexes {
-            map.insert(find_name(i, &helper), Arc::new(i.clone()));
+            let _ = map.insert(find_name(i, &helper), Arc::new(i.clone()));
         }
         IndexResolver { map }
     }
 
     pub fn find_index(&self, name: &str) -> Option<Arc<Vec<i32>>> {
-        self.map.get(name).map(|e| e.value().clone())
+        self.map.get(name).map(|e| e.get().clone())
     }
 
     pub fn is_single_message(&self) -> bool {

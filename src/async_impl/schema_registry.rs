@@ -63,10 +63,6 @@ impl SrSettings {
             timeout: Duration::from_secs(30),
         }
     }
-
-    pub(crate) fn url(&self) -> &str {
-        &self.urls[0]
-    }
 }
 
 /// Builder for SrSettings

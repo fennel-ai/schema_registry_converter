@@ -25,6 +25,11 @@ easy = ["tokio"]
 kafka_test = []
 default = ["futures", "native_tls"]
 
+[dependencies]
+defer = "0.2.1"
+log = "0.4.22"
+scc = "2.1.6"
+
 [dependencies.byteorder]
 version = "^1.5"
 

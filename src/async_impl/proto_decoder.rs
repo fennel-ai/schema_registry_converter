@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use bytes::Bytes;
-use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
-use futures::future::{BoxFuture, Shared};
+use scc::{HashMap, hash_map::Entry};
+use defer::defer;
+use futures::future::BoxFuture;
 use futures::FutureExt;
+use log::{debug, info};
 use std::sync::Arc;
 
 use crate::async_impl::schema_registry::{
@@ -16,36 +17,33 @@ use crate::schema_registry_common::{get_bytes_result, BytesResult, RegisteredSch
 use protofish::context::Context;
 use protofish::decode::{MessageValue, Value};
 
-type SharedFutureSchema<'a> = Shared<BoxFuture<'a, Result<Arc<Vec<String>>, SRCError>>>;
-
 #[derive(Debug)]
-pub struct ProtoDecoder<'a> {
+pub struct ProtoDecoder {
     sr_settings: SrSettings,
-    direct_cache: DashMap<u32, Arc<Vec<String>>>,
-    cache: DashMap<u32, SharedFutureSchema<'a>>,
+    error_cache: HashMap<u32, SRCError>,
+    cache: HashMap<u32, Arc<Vec<String>>>,
+    context_cache: HashMap<u32, Arc<DecodeContext>>,
 }
 
-impl<'a> ProtoDecoder<'a> {
+impl ProtoDecoder {
     /// Creates a new decoder which will use the supplied url used in creating the sr settings to
     /// fetch the schema's since the schema needed is encoded in the binary, independent of the
     /// SubjectNameStrategy we don't need any additional data. It's possible for recoverable errors
     /// to stay in the cache, when a result comes back as an error you can use
     /// remove_errors_from_cache to clean the cache, keeping the correctly fetched schema's
-    pub fn new(sr_settings: SrSettings) -> ProtoDecoder<'a> {
+    pub fn new(sr_settings: SrSettings) -> ProtoDecoder {
         ProtoDecoder {
             sr_settings,
-            direct_cache: DashMap::new(),
-            cache: DashMap::new(),
+            cache: HashMap::new(),
+            error_cache: HashMap::new(),
+            context_cache: Default::default(),
         }
     }
     /// Remove all the errors from the cache, you might need to/want to run this when a recoverable
     /// error is met. Errors are also cashed to prevent trying to get schema's that either don't
     /// exist or can't be parsed.
     pub fn remove_errors_from_cache(&self) {
-        self.cache.retain(|_, v| match v.peek() {
-            Some(r) => r.is_ok(),
-            None => true,
-        });
+        self.error_cache.clear();
     }
     /// Decodes bytes into a value.
     /// The choice to use Option<&[u8]> as type us made so it plays nice with the BorrowedMessage
@@ -64,6 +62,10 @@ impl<'a> ProtoDecoder<'a> {
     /// The actual deserialization trying to get the id from the bytes to retrieve the schema, and
     /// using a reader transforms the bytes to a value.
     async fn deserialize(&self, id: u32, bytes: &[u8]) -> Result<MessageValue, SRCError> {
+        debug!("{:?}: Enter: deserialize", std::thread::current().id());
+        defer! {
+            debug!("{:?}: Exit: deserialize", std::thread::current().id())
+        }
         let vec_of_schemas = self.get_vec_of_schemas(id).await?;
         let context = into_decode_context(vec_of_schemas.to_vec())?;
         let (index, data) = to_index_and_data(bytes);
@@ -80,6 +82,10 @@ impl<'a> ProtoDecoder<'a> {
         &self,
         bytes: Option<&[u8]>,
     ) -> Result<Option<DecodeResultWithContext>, SRCError> {
+        debug!("{:?}: Enter: decode_with_context", std::thread::current().id());
+        defer! {
+            debug!("{:?}: Exit: decode_with_context", std::thread::current().id())
+        }
         match get_bytes_result(bytes) {
             BytesResult::Null => Ok(None),
             BytesResult::Valid(id, bytes) => {
@@ -93,6 +99,7 @@ impl<'a> ProtoDecoder<'a> {
             }
         }
     }
+
     /// The actual deserialization trying to get the id from the bytes to retrieve the schema, and
     /// using a reader transforms the bytes to a value.
     async fn deserialize_with_context(
@@ -100,51 +107,82 @@ impl<'a> ProtoDecoder<'a> {
         id: u32,
         bytes: &[u8],
     ) -> Result<DecodeResultWithContext, SRCError> {
-        let vec_of_schemas = self.get_vec_of_schemas(id).await?;
-        let context = into_decode_context(vec_of_schemas.to_vec())?;
-        let (index, data_bytes) = to_index_and_data(bytes);
-        let full_name = resolve_name(&context.resolver, &index)?;
-        let message_info = context.context.get_message(&full_name).unwrap();
-        let value = message_info.decode(&data_bytes, &context.context);
-        Ok(DecodeResultWithContext {
-            value,
-            context,
-            full_name,
-            data_bytes,
-        })
-    }
-    /// Gets the vector of schema's directly of via a shared future. The direct cache main function
-    /// is for performance.
-    async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
-        match self.direct_cache.get(&id) {
-            None => {
-                let result = self.get_vec_of_schemas_by_shared_future(id).await;
-                if result.is_ok() && !self.direct_cache.contains_key(&id) {
-                    self.direct_cache.insert(id, result.clone().unwrap());
-                    self.cache.remove(&id);
-                };
-                result
+        debug!("{:?}: Enter: deserialize_with_context", std::thread::current().id());
+        defer! {
+            debug!("{:?}: Exit: deserialize_with_context", std::thread::current().id())
+        }
+        match self.context(id).await {
+            Ok(context) => {
+                let (index, data_bytes) = to_index_and_data(bytes);
+                let full_name = resolve_name(&context.resolver, &index)?;
+                let message_info = context.context.get_message(&full_name).unwrap();
+                let value = message_info.decode(&data_bytes, &context.context);
+                Ok(DecodeResultWithContext {
+                    value,
+                    context,
+                    full_name,
+                    data_bytes,
+                })
             }
-            Some(result) => Ok(result.value().clone()),
+            Err(e) => Err(e),
         }
     }
+
     /// Gets the vector of schema's by a shared future, to prevent multiple of the same calls to
     /// schema registry, either from the cache, or from the schema registry and then putting
     /// it into the cache.
-    fn get_vec_of_schemas_by_shared_future(&self, id: u32) -> SharedFutureSchema<'a> {
-        match self.cache.entry(id) {
-            Entry::Occupied(e) => e.get().clone(),
+    async fn get_vec_of_schemas(&self, id: u32) -> Result<Arc<Vec<String>>, SRCError> {
+        info!("Thread {:?}: Enter: get_vec_of_schemas for schema id: {}", std::thread::current().id(), id);
+        defer! {
+            info!("Thread {:?}: Exit: get_vec_of_schemas for schema id: {}", std::thread::current().id(), id)
+        }
+        match self.cache.entry_async(id).await {
+            Entry::Occupied(e) => Ok(e.get().clone()),
             Entry::Vacant(e) => {
+                // Return the cached error if it exists.
+                if let Some(err) = self.error_cache.get(&id) {
+                    info!("Thread {:?}: cached error for schema id {} - {:?}", std::thread::current().id(), id, err);
+                    return Err(err.get().clone());
+                }
+                info!("Thread {:?}: Vacant get_vec_of_schemas for schema id {}", std::thread::current().id(), id);
                 let sr_settings = self.sr_settings.clone();
-                let v = async move {
-                    match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
-                        Ok(v) => to_vec_of_schemas(&sr_settings, v).await,
-                        Err(e) => Err(e.into_cache()),
+                let result = match get_schema_by_id_and_type(id, &sr_settings, SchemaType::Protobuf).await {
+                    Ok(registered_schema) => {
+                        to_vec_of_schemas(&sr_settings, registered_schema).await
+                    }
+                    Err(err) => Err(err)
+                };
+                match result {
+                    Ok(v) => {
+                        info!("Thread {:?}: Inserting schema for id {}", std::thread::current().id(), id);
+                        Ok(e.insert_entry(v).get().clone())
+                    }
+                    Err(e) => {
+                        let e = e.into_cache();
+                        info!("Thread {:?}: Inserting error for schema id {}", std::thread::current().id(), id);
+                        self.error_cache.insert(id, e.clone()).unwrap();
+                        Err(e)
                     }
                 }
-                    .boxed()
-                    .shared();
-                e.insert(v).value().clone()
+            }
+        }
+    }
+
+    /// Gets the Context object, either from the cache, or from the schema registry and then putting
+    /// it into the cache.
+    async fn context(&self, id: u32) -> Result<Arc<DecodeContext>, SRCError> {
+        debug!("{:?}: Enter: context", std::thread::current().id());
+        defer! {
+            debug!("{:?}: Exit: context", std::thread::current().id())
+        }
+        match self.context_cache.entry_async(id).await {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                info!("Thread {:?} - Vacant context for schema id {}", std::thread::current().id(), id);
+                let vec_of_schemas = self.get_vec_of_schemas(id).await?;
+                info!("Thread {:?} - Creating context for schema id {}", std::thread::current().id(), id);
+                let v = into_decode_context(vec_of_schemas.to_vec()).map(|context| Arc::new(context))?;
+                Ok(e.insert_entry(v).get().clone())
             }
         }
     }
@@ -153,7 +191,7 @@ impl<'a> ProtoDecoder<'a> {
 #[derive(Debug)]
 pub struct DecodeResultWithContext {
     pub value: MessageValue,
-    pub context: DecodeContext,
+    pub context: Arc<DecodeContext>,
     pub full_name: Arc<String>,
     pub data_bytes: Vec<u8>,
 }
@@ -183,8 +221,9 @@ pub struct DecodeContext {
 fn into_decode_context(vec_of_schemas: Vec<String>) -> Result<DecodeContext, SRCError> {
     let resolver = MessageResolver::new(vec_of_schemas.last().unwrap());
     let mut files: HashSet<String> = HashSet::new();
-    add_common_files(resolver.imports(), &mut files);
     for s in vec_of_schemas {
+        let dependent_resolver = MessageResolver::new(&s);
+        add_common_files(dependent_resolver.imports(), &mut files);
         files.insert(s);
     }
 
@@ -209,7 +248,7 @@ async fn to_vec_of_schemas(
 #[cfg(test)]
 mod tests {
     use mockito::Server;
-    use crate::async_impl::proto_decoder::ProtoDecoder;
+    use crate::async_impl::proto_decoder::{into_decode_context, ProtoDecoder};
     use crate::async_impl::schema_registry::SrSettings;
     use protofish::prelude::Value;
     use test_utils::{
@@ -349,5 +388,14 @@ mod tests {
         assert!(
             format!("{:?}", decoder).starts_with("ProtoDecoder { sr_settings: SrSettings { urls: [\"http://127.0.0.1:1234\"], client: Client {")
         )
+    }
+
+    #[test]
+    fn test_into_decode_context() {
+        let base_schema = "syntax = \"proto3\";\npackage a.b.c;\n\nimport \"google/protobuf/timestamp.proto\";\n\noption java_outer_classname = \"MetadataProto\";\n\nmessage Metadata {\n  string field1 = 1;\n  string field2 = 2;\n  .google.protobuf.Timestamp field3 = 3;\n}\n";
+        let top_schema = "syntax = \"proto3\";\npackage a.b.c.d;\n\nimport \"a/b/c/metadata.proto\";\n\noption java_outer_classname = \"TopLevelProto\";\n\nmessage TopLevelMetadata {\n  uint64 field1 = 1;\n  .a.b.c.Metadata metadata = 3;\n\n}\n";
+        let vec_of_schemas = vec![base_schema.to_string(), top_schema.to_string()];
+        let result = into_decode_context(vec_of_schemas);
+        assert!(result.is_ok())
     }
 }
